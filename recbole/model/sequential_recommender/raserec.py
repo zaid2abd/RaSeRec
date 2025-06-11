@@ -22,7 +22,9 @@ import numpy as np
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import TransformerEncoder, CrossMultiHeadAttention, FeedForward, activation_layer, MLPLayers
 from recbole.model.loss import BPRLoss
+import torch.nn.functional as F
 
+from recbole.model.sequential_recommender.meta_alpha_gate import MetaAlphaFusionGate
 
 class RaSeRec(SequentialRecommender):
     r"""
@@ -91,6 +93,45 @@ class RaSeRec(SequentialRecommender):
         self.mask_default = self.mask_correlated_samples(batch_size=self.batch_size)
         self.aug_nce_fct = nn.CrossEntropyLoss()
         self.sem_aug_nce_fct = nn.CrossEntropyLoss()
+        
+      
+        # إضافة Meta-α Fusion Gate
+        self.meta_fusion_gate = MetaAlphaFusionGate(
+            hidden_size=self.hidden_size,
+            dropout_prob=self.hidden_dropout_prob
+        )
+        
+        # إضافة optimizer منفصل للبوابة
+        gate_lr = config['gate_learning_rate'] if 'gate_learning_rate' in config else 0.01
+        self.gate_optimizer = torch.optim.Adam(
+            self.meta_fusion_gate.parameters(),
+            lr=gate_lr  # استخدام معدل تعلم مخصص للبوابة
+        )
+        print(f"🔧 Gate optimizer created with learning rate: {gate_lr}")
+
+        # إضافة معلمات للتدريب التدريجي
+        self.gate_warmup_epochs = config['gate_warmup_epochs'] if 'gate_warmup_epochs' in config else 5
+        self.current_epoch = 0
+
+        # إضافة معلمات لجدولة معدل التعلم
+        self.gate_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.gate_optimizer, 
+            mode='max', 
+            factor=0.5, 
+            patience=3,
+            verbose=True
+        )
+
+        # بعد إنشاء meta_fusion_gate:
+        print("🔍 Checking Meta-α Fusion Gate parameters:")
+        for name, param in self.meta_fusion_gate.named_parameters():
+            print(f"  {name}: requires_grad={param.requires_grad}, shape={param.shape}")
+
+        # معامل تنظيم البوابة
+        self.gate_regularization_weight = config['gate_reg_weight'] if 'gate_reg_weight' in config else 0.01
+
+        # إعداد تحميل checkpoint مع التعامل مع الأجزاء الجديدة
+        self.strict_loading = False
 
         # parameters initialization
         self.apply(self._init_weights)
@@ -260,7 +301,6 @@ class RaSeRec(SequentialRecommender):
         self.tar_emb_index.add(tar_emb_knowledge_copy) 
         self.tar_emb_index.nprobe=self.nprobe
     
-    
     def presetting_ram(self):
         dropout_rate = self.dropout_rate
         n_heads = self.n_heads
@@ -304,7 +344,6 @@ class RaSeRec(SequentialRecommender):
         self.seq_tar_ram_position_embedding_retrieval = nn.Embedding(self.topk, self.hidden_size).to("cuda")
 
         self.tar_seq_ram_position_embedding_retrieval = nn.Embedding(self.topk, self.hidden_size).to("cuda")
-
 
     def _init_weights(self, module):
         """ Initialize the weights """
@@ -365,40 +404,124 @@ class RaSeRec(SequentialRecommender):
         input_emb = self.dropout(input_emb)
 
         extended_attention_mask = self.get_attention_mask(item_seq)
-        # extended_attention_mask = self.get_bi_attention_mask(item_seq)
 
         trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
         output = trm_output[-1]
         output = self.gather_indexes(output, item_seq_len - 1)
+        
         return output  # [B H]
 
     def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
+        # تأكد من أن seq_output يحتفظ بالمشتقات
+        seq_output = seq_output.requires_grad_(True)
+        
         torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, torch_retrieval_seq_embs2, torch_retrieval_tar_embs2 = self.retrieve_seq_tar(seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode)
 
-        # augmentation
-        seq_output_saug = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1)
-        seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
-        seq_output_saug = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1) 
-        seq_output_taug = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
-        seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
-        seq_output_taug = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
-        alpha = self.alpha
-        beta = self.beta
+        # تصفية وترجيح الذكريات المسترجعة
+        filtered_seq_embs1, filtered_tar_embs1, relevance_scores1 = self.filter_and_weight_memories(
+            seq_output, torch_retrieval_seq_embs1, torch_retrieval_tar_embs1
+        )
+        
+        filtered_seq_embs2, filtered_tar_embs2, relevance_scores2 = self.filter_and_weight_memories(
+            seq_output, torch_retrieval_seq_embs2, torch_retrieval_tar_embs2
+        )
 
-        # output
-        seq_output = alpha*seq_output+(1-alpha)*(beta*seq_output_saug+(1-beta)*seq_output_taug)
-        return seq_output
+        # augmentation مع الذكريات المصفاة
+        seq_output_saug = self.seq_tar_ram(seq_output.unsqueeze(1), filtered_seq_embs1, filtered_tar_embs1)
+        seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
+        seq_output_saug = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), filtered_seq_embs1, filtered_tar_embs1) 
+        
+        seq_output_taug = self.tar_seq_ram(seq_output.unsqueeze(1), filtered_tar_embs2, filtered_seq_embs2)
+        seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
+        seq_output_taug = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), filtered_tar_embs2, filtered_seq_embs2)
+        
+        # دمج الذكريات من كلا المصدرين
+        if filtered_seq_embs1.dim() == 3 and filtered_seq_embs2.dim() == 3:
+            retrieved_memories = torch.cat([filtered_seq_embs1, filtered_seq_embs2], dim=1)
+        else:
+            retrieved_memories = filtered_seq_embs1
+
+        # التأكد من أبعاد صحيحة قبل الدمج
+        if seq_output_saug.dim() > 2:
+            seq_output_saug = seq_output_saug.squeeze(1)
+        if seq_output_taug.dim() > 2:
+            seq_output_taug = seq_output_taug.squeeze(1)
+        
+        # تأكد من أن المدخلات تحتفظ بالمشتقات
+        seq_output_saug = seq_output_saug.requires_grad_(True)
+        seq_output_taug = seq_output_taug.requires_grad_(True)
+        
+        # إضافة معلومات الصلة إلى البوابة
+        seq_output_enhanced, gate_info = self.meta_fusion_gate(
+            user_repr=seq_output,
+            channel1_repr=seq_output_saug,
+            channel2_repr=seq_output_taug,
+            retrieved_memories=retrieved_memories
+        )
+        
+        # إضافة معلومات الصلة إلى gate_info
+        gate_info['memory_relevance'] = torch.mean(relevance_scores1, dim=1)
+        
+        # حفظ معلومات البوابة للاستخدام في حساب الخسارة
+        self.last_gate_info = gate_info
+        
+        # جمع إحصائيات α, β
+        if not hasattr(self, 'alpha_stats'):
+            self.alpha_stats = []
+            self.beta_stats = []
+            self.relevance_stats = []
+        
+        # حفظ قيم α, β, relevance للتحليل
+        self.alpha_stats.extend(gate_info['adaptive_alpha'].detach().cpu().numpy().flatten())
+        self.beta_stats.extend(gate_info['adaptive_beta'].detach().cpu().numpy().flatten())
+        self.relevance_stats.extend(gate_info['memory_relevance'].detach().cpu().numpy().flatten())
+        
+        return seq_output_enhanced
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
+        
+        # تحديث رقم الحقبة الحالية
+        if not hasattr(self, 'current_epoch'):
+            self.current_epoch = 0
+
+        # استخدام النموذج الأصلي في الحقب الأولى للتدريب المسبق
+        use_original_model = self.current_epoch < self.gate_warmup_epochs
+        
         pos_items = interaction[self.POS_ITEM_ID]
         batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
         batch_seq_len = list(item_seq_len.detach().cpu().numpy())
+    
         # aug
-        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
+        if use_original_model:
+            # استخراج تمثيلات القنوات
+            torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, torch_retrieval_seq_embs2, torch_retrieval_tar_embs2 = self.retrieve_seq_tar(seq_output, batch_user_id, batch_seq_len, topk=self.topk)
+            
+            seq_output_saug = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1)
+            seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
+            seq_output_saug = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1)
+            if seq_output_saug.dim() > 2:
+                seq_output_saug = seq_output_saug.squeeze(1)
+            
+            seq_output_taug = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
+            seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
+            seq_output_taug = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
+            if seq_output_taug.dim() > 2:
+                seq_output_taug = seq_output_taug.squeeze(1)
+            
+            # استخدام المعاملات الثابتة كما في النموذج الأصلي
+            alpha = self.alpha
+            beta = self.beta
+            seq_output_aug = alpha * seq_output + (1 - alpha) * (beta * seq_output_saug + (1 - beta) * seq_output_taug)
+        else:
+            # استخدام البوابة التكيفية
+            seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
+
         seq_output_aug = torch.where((item_seq_len > self.low_popular).unsqueeze(-1).repeat(1, 64), seq_output, seq_output_aug)
+
+    
         if self.loss_type == 'BPR':
             neg_items = interaction[self.NEG_ITEM_ID]
             pos_items_emb = self.item_embedding(pos_items)
@@ -411,7 +534,47 @@ class RaSeRec(SequentialRecommender):
             logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
             loss = self.loss_fct(logits, pos_items)
 
-        return loss
+        # إضافة تنظيم البوابة فقط بعد مرحلة التدريب المسبق
+        if not use_original_model and hasattr(self, 'last_gate_info') and self.last_gate_info is not None:
+            gate_reg_loss = self.compute_gate_regularization(self.last_gate_info)
+            
+            # تحديث البوابة بشكل صريح
+            self.gate_optimizer.zero_grad()
+            
+            # تحديث مباشر للمعاملات بدلاً من backward
+            with torch.no_grad():
+                # تحريك alpha نحو 0.7
+                target_alpha = 0.7
+                current_alpha = torch.sigmoid(self.meta_fusion_gate.alpha_param).item()
+                alpha_step = 0.05 * (target_alpha - current_alpha)  # زيادة معدل التحديث من 0.01 إلى 0.05
+                
+                # تحريك beta نحو 0.3
+                target_beta = 0.3
+                current_beta = torch.sigmoid(self.meta_fusion_gate.beta_param).item()
+                beta_step = 0.05 * (target_beta - current_beta)  # زيادة معدل التحديث من 0.01 إلى 0.05
+                
+                # تطبيق التحديث
+                new_alpha = self.meta_fusion_gate.alpha_param + alpha_step
+                new_beta = self.meta_fusion_gate.beta_param + beta_step
+                
+                self.meta_fusion_gate.alpha_param.copy_(new_alpha)
+                self.meta_fusion_gate.beta_param.copy_(new_beta)
+
+            # طباعة معلومات تشخيصية
+            if hasattr(self, 'debug_counter'):
+                self.debug_counter += 1
+            else:
+                self.debug_counter = 0
+                
+            if self.debug_counter % 100 == 0:
+                alpha_param = torch.sigmoid(self.meta_fusion_gate.alpha_param).item()
+                beta_param = torch.sigmoid(self.meta_fusion_gate.beta_param).item()
+                print(f"🔧 Gate params: α={alpha_param:.4f}, β={beta_param:.4f}, steps: α={alpha_step:.4f}, β={beta_step:.4f}")
+            
+            total_loss = loss + self.gate_regularization_weight * gate_reg_loss
+            return total_loss
+        else:
+            return loss
 
     def mask_correlated_samples(self, batch_size):
         N = 2 * batch_size
@@ -521,3 +684,93 @@ class RaSeRec(SequentialRecommender):
         test_items_emb = self.item_embedding.weight
         scores = torch.matmul(seq_output_aug, test_items_emb.transpose(0, 1))  # [B n_items]
         return scores
+
+    def filter_and_weight_memories(self, query_repr, retrieved_seq_embs, retrieved_tar_embs):
+        """
+        تصفية وترجيح الذكريات المسترجعة بناءً على مدى صلتها بالاستعلام
+        
+        Args:
+            query_repr: تمثيل المستخدم الحالي [batch_size, hidden_size]
+            retrieved_seq_embs: تمثيلات المستخدمين المسترجعة [batch_size, K, hidden_size]
+            retrieved_tar_embs: تمثيلات العناصر المستهدفة المسترجعة [batch_size, K, hidden_size]
+        
+        Returns:
+            filtered_seq_embs: تمثيلات المستخدمين المصفاة والمرجحة
+            filtered_tar_embs: تمثيلات العناصر المستهدفة المصفاة والمرجحة
+            relevance_scores: درجات الصلة للذكريات المسترجعة
+        """
+        batch_size, K, hidden_size = retrieved_seq_embs.shape
+        
+        # حساب درجات التشابه بين الاستعلام وكل ذاكرة مسترجعة
+        query_expanded = query_repr.unsqueeze(1).expand(-1, K, -1)  # [batch_size, K, hidden_size]
+        
+        # استخدام تشابه الجيب التمام للحصول على درجات بين 0 و 1
+        relevance_scores = F.cosine_similarity(query_expanded, retrieved_seq_embs, dim=2)  # [batch_size, K]
+        
+        # تطبيق softmax للحصول على أوزان تجمع إلى 1
+        attention_weights = F.softmax(relevance_scores / 0.1, dim=1).unsqueeze(2)  # [batch_size, K, 1]
+        
+        # ترجيح الذكريات بأوزان الانتباه
+        filtered_seq_embs = retrieved_seq_embs * attention_weights
+        filtered_tar_embs = retrieved_tar_embs * attention_weights
+        
+        return filtered_seq_embs, filtered_tar_embs, relevance_scores
+
+    def compute_gate_regularization(self, gate_info):
+        """حساب خسارة تنظيم للبوابة لتشجيع قيم متوازنة"""
+        # تشجيع alpha على أن تكون أكبر من 0.5 (تفضيل تمثيل المستخدم الأصلي)
+        alpha_reg = torch.mean(torch.relu(0.6 - gate_info['adaptive_alpha']))
+        
+        # تشجيع beta على أن تكون أقل من 0.5 (تفضيل القناة الثانية)
+        beta_reg = torch.mean(torch.relu(gate_info['adaptive_beta'] - 0.4))
+        
+        # الخسارة الإجمالية للتنظيم
+        total_reg = alpha_reg + beta_reg
+        
+        return total_reg
+
+    def load_state_dict(self, state_dict, strict=True):
+        """تحميل checkpoint مع تجاهل الأجزاء المفقودة الجديدة"""
+        # فصل الأجزاء الخاصة بـ Meta-α Fusion Gate
+        meta_gate_keys = [k for k in state_dict.keys() if 'meta_fusion_gate' in k]
+        
+        # إذا لم توجد مفاتيح Meta-α Fusion Gate في الـ checkpoint
+        if not meta_gate_keys:
+            print("⚠️ Warning: Meta-α Fusion Gate not found in the checkpoint.")
+            print("→ Initializing Meta-α Fusion Gate with random weights.")
+            
+            # إزالة المفاتيح المفقودة من التحقق الصارم
+            missing_keys = [k for k in self.state_dict().keys() if 'meta_fusion_gate' in k]
+            for key in missing_keys:
+                if key in self.state_dict():
+                    state_dict[key] = self.state_dict()[key]
+        
+        # تحميل باقي الأوزان
+        return super().load_state_dict(state_dict, strict=False)
+            
+    def print_gate_statistics(self, epoch):
+        """طباعة إحصائيات البوابة المتعلمة"""
+        if hasattr(self, 'alpha_stats') and len(self.alpha_stats) > 0:
+            import numpy as np
+            
+            alpha_mean = np.mean(self.alpha_stats)
+            beta_mean = np.mean(self.beta_stats)
+            relevance_mean = np.mean(self.relevance_stats) if hasattr(self, 'relevance_stats') and len(self.relevance_stats) > 0 else 0.0
+            
+            # القيم الحالية للمعاملات
+            alpha_value = torch.sigmoid(self.meta_fusion_gate.alpha_param).item()
+            beta_value = torch.sigmoid(self.meta_fusion_gate.beta_param).item()
+            
+            print(f"-------------------")
+            print(f"Epoch {epoch} Gate Statistics:")
+            print(f"Current gate params: α={alpha_value:.4f}, β={beta_value:.4f}")
+            print(f"Applied values: α mean={alpha_mean:.4f}, β mean={beta_mean:.4f}")
+            print(f"Memory relevance mean={relevance_mean:.4f}")
+            print(f"Samples={len(self.alpha_stats)}")
+            print(f"-------------------")
+            
+            # إعادة تعيين للـ epoch التالي
+            self.alpha_stats = []
+            self.beta_stats = []
+            if hasattr(self, 'relevance_stats'):
+                self.relevance_stats = []

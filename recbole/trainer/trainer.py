@@ -150,6 +150,11 @@ class Trainer(AbstractTrainer):
             tuple which includes the sum of loss in each part.
         """
         self.model.train()
+        
+        # تحديث رقم الحقبة الحالية في النموذج إذا كان يدعم ذلك
+        if hasattr(self.model, 'current_epoch'):
+            self.model.current_epoch = epoch_idx
+        
         loss_func = loss_func or self.model.calculate_loss
         total_loss = None
         iter_data = (
@@ -198,6 +203,11 @@ class Trainer(AbstractTrainer):
         """
         valid_result = self.evaluate(valid_data, load_best_model=False, show_progress=show_progress)
         valid_score = calculate_valid_score(valid_result, self.valid_metric)
+        
+        # تحديث جدولة معدل التعلم للبوابة إذا كان النموذج يدعم ذلك
+        if hasattr(self.model, 'gate_lr_scheduler'):
+            self.model.gate_lr_scheduler.step(valid_score)
+
         return valid_score, valid_result
 
     def _save_checkpoint(self, epoch):
@@ -334,6 +344,11 @@ class Trainer(AbstractTrainer):
                     if verbose:
                         self.logger.info(stop_output)
                     break
+                
+                # إضافة هنا: طباعة إحصائيات البوابة
+                if hasattr(self.model, 'print_gate_statistics'):
+                    self.model.print_gate_statistics(epoch_idx)
+            
         if self.draw_loss_pic:
             save_path = '{}-{}-train_loss.pdf'.format(self.config['model'], get_local_time())
             self.plot_train_loss(save_path=os.path.join(save_path))
