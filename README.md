@@ -98,4 +98,4 @@ This work builds upon the RaSeRec framework by Zhao et al. (2024). We thank the 
 
 
 # Credit
-This repo is based on [RecBole](https://github.com/RUCAIBox/RecBole) and [DuoRec](https://github.com/RuihongQiu/DuoRec).
+This repo is based on [RecBole](https://github.com/RUCAIBox/RecBole) and [RaSeRec](https://github.com/HITsz-TMG/RaSeRec).
