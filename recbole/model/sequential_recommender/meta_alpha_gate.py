@@ -11,27 +11,24 @@ class MetaAlphaFusionGate(nn.Module):
         self.hidden_size = hidden_size
         
         # معاملات قابلة للتعلم
-        self.alpha_param = nn.Parameter(torch.tensor(0.4))  # sigmoid(0.4) ≈ 0.6
-        self.beta_param = nn.Parameter(torch.tensor(-0.4))  # sigmoid(-0.4) ≈ 0.4
+        self.alpha_param = nn.Parameter(torch.tensor(0.42))  # sigmoid(0.42) ≈ 0.603
+        self.beta_param = nn.Parameter(torch.tensor(-0.42))  # sigmoid(-0.42) ≈ 0.397
 
         print(f"🔧 Initialized Learnable Meta-α Fusion Gate")
         print(f"🔧 Initial params: α={torch.sigmoid(self.alpha_param).item():.4f}, β={torch.sigmoid(self.beta_param).item():.4f}")
         
     def forward(self, user_repr, channel1_repr, channel2_repr, retrieved_memories):
-        """
-        Args:
-            user_repr: [batch_size, hidden_size]
-            channel1_repr: [batch_size, hidden_size] 
-            channel2_repr: [batch_size, hidden_size]
-            retrieved_memories: [batch_size, K, hidden_size]
-        """
         batch_size = user_repr.size(0)
+        
+        # إجبار requires_grad=True
+        self.alpha_param.requires_grad_(True)
+        self.beta_param.requires_grad_(True)
         
         # استخدام parameters قابلة للتعلم
         adaptive_alpha = torch.sigmoid(self.alpha_param).expand(batch_size, 1)
         adaptive_beta = torch.sigmoid(self.beta_param).expand(batch_size, 1)
         
-        # الدمج باستخدام المعاملات المتعلمة
+        # الدمج باستخدام المعاملات المتعلمة (النسخة الأصلية)
         fused_representation = (
             adaptive_alpha * user_repr + 
             (1 - adaptive_alpha) * (
@@ -40,18 +37,13 @@ class MetaAlphaFusionGate(nn.Module):
             )
         )
         
-        # حساب مقياس الصلة للذكريات المسترجعة
-        if retrieved_memories.dim() == 3:
-            memory_relevance = torch.mean(F.cosine_similarity(
-                user_repr.unsqueeze(1).expand(-1, retrieved_memories.size(1), -1),
-                retrieved_memories,
-                dim=2
-            ), dim=1, keepdim=True)
-        else:
-            memory_relevance = torch.ones_like(adaptive_alpha)
+        # التأكد من أن النتيجة تحتفظ بـ gradients
+        fused_representation = fused_representation.requires_grad_(True)
+        
+        print(f"🔍 Meta-α: α={torch.sigmoid(self.alpha_param).item():.4f}, β={torch.sigmoid(self.beta_param).item():.4f}")
         
         return fused_representation, {
             'adaptive_alpha': adaptive_alpha,
             'adaptive_beta': adaptive_beta,
-            'memory_relevance': memory_relevance
+            'memory_relevance': torch.ones_like(adaptive_alpha)
         }

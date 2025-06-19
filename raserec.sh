@@ -40,7 +40,32 @@
 #     --meta_fusion_enabled=true \
 
 
-# Retrieval-Augmented Fine-tuning Stage with Learnable Meta-α Fusion Gate
+
+# python run_seq.py \
+#     --dataset='beauty' \
+#     --nprobe=1 \
+#     --attn_tau=1.0 \
+#     --dropout_rate=0.5 \
+#     --alpha=0.5 \
+#     --beta=0.5 \
+#     --top_k=20 \
+#     --learning_rate=0.001 \
+#     --metrics="['Recall', 'NDCG']" \
+#     --valid_metric="Recall@10" \
+#     --stopping_step=15 \
+#     --train_batch_size=1024 \
+#     --model='RaSeRec' \
+#     --sim='dot' \
+#     --tau=1 \
+#     --nproc=2 \
+#     --epochs=100 \
+#     --data_path="./recbole/dataset" \
+#     --pre_training_ckt="./log/DuoRec/beauty/bs256-lmd0.1-sem0.1-us_x-Sep-26-2024_19-07-19-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth" \
+#     --gate_reg_weight=0.01 \
+#     --meta_fusion_enabled=true \
+#     --gate_warmup_epochs=15 \
+
+
 python run_seq.py \
     --dataset='beauty' \
     --nprobe=1 \
@@ -48,7 +73,8 @@ python run_seq.py \
     --dropout_rate=0.5 \
     --alpha=0.5 \
     --beta=0.5 \
-    --top_k=30 \
+    --top_k=20 \
+    --learning_rate=0.0009 \
     --metrics="['Recall', 'NDCG']" \
     --valid_metric="Recall@10" \
     --stopping_step=15 \
@@ -57,10 +83,9 @@ python run_seq.py \
     --sim='dot' \
     --tau=1 \
     --nproc=2 \
-    --epochs=150 \
+    --epochs=100 \
     --data_path="./recbole/dataset" \
     --pre_training_ckt="./log/DuoRec/beauty/bs256-lmd0.1-sem0.1-us_x-Sep-26-2024_19-07-19-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth" \
-    --gate_reg_weight=0.005 \
+    --gate_reg_weight=0.05 \
     --meta_fusion_enabled=true \
-    --gate_warmup_epochs=5 \
-    
+    --gate_warmup_epochs=15 \

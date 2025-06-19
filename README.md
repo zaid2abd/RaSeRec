@@ -54,6 +54,25 @@ Our approach shows improvements in recommendation quality, particularly for:
 
 Detailed performance metrics and comparisons are available in the experimental results section.
 
+#### Dataset: Beauty
+
+| Method             | HR@5   | NDCG@5 | HR@10  | NDCG@10 | HR@20  | NDCG@20 | HR@50  | NDCG@50 |
+|--------------------|--------|--------|--------|---------|--------|---------|--------|---------|
+| RaSeRec            | 0.0569 | 0.0370 | 0.0865 | 0.0465  | 0.1255 | 0.0563  | 0.1901 | 0.0691  |
+| RaSeRec + Mα-RAM   | 0.0559 | 0.0352 | 0.0854 | 0.0447  | 0.1235 | 0.0543  | 0.1873 | 0.0670  |
+| Δ% (Improvement)   | -1.75% | -4.86% | -1.27% | -3.87%  | -1.59% | -3.55%  | -1.47% | -3.04%  |
+
+---
+
+#### Dataset: Sports
+
+| Method             | HR@5 | NDCG@5 | HR@10 | NDCG@10 | HR@20 | NDCG@20 | HR@50 | NDCG@50 |
+|--------------------|------|--------|-------|---------|-------|---------|-------|---------|
+| RaSeRec            | --   | --     | --    | --      | --    | --      | --    | --      |
+| RaSeRec + Mα-RAM   | --   | --     | --    | --      | --    | --      | --    | --      |
+| Δ% (Improvement)   | --   | --     | --    | --      | --    | --      | --    | --      |
+
+
 ## Usage
 To use this enhanced version of RaSeRec:
 
